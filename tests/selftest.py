@@ -454,6 +454,312 @@ def test_concurrency() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# T6: downtime impact simulation
+# ---------------------------------------------------------------------------
+
+# Topology used below:
+#   E -> A -> B -> D
+#          \-> C -> D
+#   E -> F -> G          (G healthy backup of F's own upstream chain)
+#   P -> Q -> R
+#   U -> V               (V never reported)
+#   W -> M -> D, W -> K  (backup group [M, K] on W; K is a healthy leaf)
+#   T -> M               (ungrouped counterpart: must break when M breaks)
+SIM_GRAPH = {
+    "version": "sim1",
+    "services": [
+        {"name": "E", "dependencies": ["A", "F"]},
+        {"name": "A", "dependencies": ["B", "C"]},
+        {"name": "B", "dependencies": ["D"]},
+        {"name": "C", "dependencies": ["D"]},
+        {"name": "D", "dependencies": []},
+        {"name": "F", "dependencies": ["G"]},
+        {"name": "G", "dependencies": []},
+        {"name": "P", "dependencies": ["Q"]},
+        {"name": "Q", "dependencies": ["R"]},
+        {"name": "R", "dependencies": []},
+        {"name": "U", "dependencies": ["V"]},
+        {"name": "V", "dependencies": []},
+        {"name": "W", "dependencies": ["M", "K"]},
+        {"name": "M", "dependencies": ["D"]},
+        {"name": "K", "dependencies": []},
+        {"name": "T", "dependencies": ["M"]},
+    ],
+}
+
+
+def _sim(body: dict):
+    return request("POST", "/simulations/downtime", body)
+
+
+def _reason_index(result: dict) -> dict:
+    return {item["entry"]: item["reasons"] for item in result["newly_interrupted_entries"]}
+
+
+def test_downtime_simulation() -> None:
+    print("[T6] downtime impact simulation")
+    reset()
+    status, _ = request("POST", "/graph", SIM_GRAPH)
+    assert status == 200
+
+    def recover(svc: str, seq: int = 1):
+        return request("POST", "/reports",
+                       {"service": svc, "seq": seq, "status": "recover"})
+
+    for svc in ["E", "A", "B", "C", "D", "F", "G", "P", "Q", "R", "W", "M", "K", "T"]:
+        st, _ = recover(svc, 1)
+        assert st == 200, (svc, st)
+    # V stays never-reported; U is healthy but depends on unreported V.
+
+    # --- 6.1 invalid references are rejected (422), nothing changes --------
+    status, body = _sim({"stopped_service": "GHOST", "entries": ["E"]})
+    check("unknown stopped_service -> 422", status == 422 and body["error"] == "invalid_simulation", str(body))
+
+    status, body = _sim({"stopped_service": "D", "entries": ["GHOST"]})
+    check("unknown entry -> 422", status == 422, str(body))
+
+    status, body = _sim({"stopped_service": "D", "entries": ["E", "E"]})
+    check("duplicate entry -> 422", status == 422, str(body))
+
+    status, body = _sim({
+        "stopped_service": "D",
+        "entries": ["E"],
+        "backup_groups": [{"service": "GHOST", "members": ["D"]}],
+    })
+    check("backup group for unknown service -> 422", status == 422, str(body))
+
+    status, body = _sim({
+        "stopped_service": "D",
+        "entries": ["E"],
+        "backup_groups": [{"service": "A", "members": ["GHOST"]}],
+    })
+    check("unknown backup member -> 422", status == 422, str(body))
+
+    status, body = _sim({
+        "stopped_service": "D",
+        "entries": ["E"],
+        # F is not a direct dependency of A.
+        "backup_groups": [{"service": "A", "members": ["F"]}],
+    })
+    check("non-direct-dependency group member -> 422", status == 422, str(body))
+
+    status, body = _sim({
+        "stopped_service": "D",
+        "entries": ["E"],
+        "backup_groups": [{"service": "A", "members": ["B", "B"]}],
+    })
+    check("duplicate group members -> 422", status == 422, str(body))
+
+    status, body = _sim({
+        "stopped_service": "D",
+        "entries": ["E"],
+        "backup_groups": [{"service": "A", "members": []}],
+    })
+    check("empty group -> 422", status == 422, str(body))
+
+    status, body = _sim({"stopped_service": "D", "entries": []})
+    check("empty entries -> 422", status == 422, str(body))
+
+    # --- 6.2 baseline: never-reported nodes make entries unavailable -------
+    status, result = _sim({"stopped_service": "G", "entries": ["E", "U"]})
+    check("snapshot revision echoed", status == 200 and result["graph_revision"] == 1, str(result))
+    check(
+        "unreported upstream V makes U already unavailable before stop",
+        result["already_unavailable_entries"] == ["U"],
+        str(result),
+    )
+    check(
+        "already-unavailable entry is not a new interruption",
+        [i["entry"] for i in result["newly_interrupted_entries"]] == ["E"],
+        str(result),
+    )
+    check(
+        "after-unavailable is the union of baseline and new",
+        result["after_unavailable_entries"] == ["E", "U"],
+        str(result),
+    )
+    reasons = _reason_index(result)
+    check(
+        "E interruption attributed to stopped dependency chain (G itself stopped)",
+        reasons["E"][0]["type"] == "dependency_unavailable"
+        and reasons["E"][0]["dependency"] == "F",
+        str(reasons),
+    )
+
+    # --- 6.3 transitive availability: stop a leaf upstream -----------------
+    status, result = _sim({"stopped_service": "D", "entries": ["E", "A", "B", "C", "G"]})
+    check("stopping D breaks B, C, A, E transitively", status == 200, str(result))
+    check(
+        "newly interrupted = B, C, A, E; G stays available",
+        [i["entry"] for i in result["newly_interrupted_entries"]] == ["E", "A", "B", "C"],
+        str(result),
+    )
+    check(
+        "G remains in service (not affected by D's stop)",
+        result["after_unavailable_entries"] == ["E", "A", "B", "C"],
+        str(result),
+    )
+    reasons = _reason_index(result)
+    b_types = {r["type"] for r in reasons["B"]}
+    check("B fails via plain ungrouped dependency D", b_types == {"dependency_unavailable"}, str(reasons))
+    check("B reason pins direct dependency D", reasons["B"][0]["dependency"] == "D", str(reasons))
+
+    # --- 6.4 backup group saves the entry ----------------------------------
+    # W's direct deps are M (dies with D) and K (healthy leaf).  Grouped, the
+    # group still has one available member, so W survives; T, which depends on
+    # M without a group, must break.
+    status, result = _sim({
+        "stopped_service": "D",
+        "entries": ["W", "T", "M"],
+        "backup_groups": [{"service": "W", "members": ["M", "K"]}],
+    })
+    check("backup group keeps W available while D is down", status == 200, str(result))
+    check(
+        "newly interrupted are only M and ungrouped T; W is saved",
+        [i["entry"] for i in result["newly_interrupted_entries"]] == ["T", "M"],
+        str(result),
+    )
+    check("W is not unavailable after the stop", "W" not in result["after_unavailable_entries"], str(result))
+
+    # Same request without the group: W breaks exactly like T.
+    status, result = _sim({"stopped_service": "D", "entries": ["W", "T", "M"]})
+    check(
+        "without the backup group W breaks through ungrouped M",
+        [i["entry"] for i in result["newly_interrupted_entries"]] == ["W", "T", "M"],
+        str(result),
+    )
+
+    # --- 6.5 backup group loses every available member ---------------------
+    status, result = _sim({
+        "stopped_service": "D",
+        "entries": ["A"],
+        "backup_groups": [{"service": "A", "members": ["B", "C"]}],
+    })
+    check("group fully down -> A interrupted", status == 200, str(result))
+    reasons = _reason_index(result)
+    check(
+        "interruption reason is group_lost_available_member with both members listed",
+        reasons["A"][0]["type"] == "group_lost_available_member"
+        and reasons["A"][0]["group_members"] == ["B", "C"],
+        str(reasons),
+    )
+
+    # --- 6.6 backup member's own upstream failure also counts ---------------
+    # F depends only on G; declare G as its backup group. Break G by a fault
+    # report, then stop an unrelated service R: the group must already be dead.
+    request("POST", "/reports", {"service": "G", "seq": 2, "status": "fault"})
+    status, result = _sim({
+        "stopped_service": "R",
+        "entries": ["F", "P", "G"],
+        "backup_groups": [{"service": "F", "members": ["G"]}],
+    })
+    check("faulty backup member (upstream fault) is counted", status == 200, str(result))
+    check(
+        "F already unavailable before the stop because backup G is faulty",
+        result["already_unavailable_entries"] == ["F", "G"],
+        str(result),
+    )
+    check(
+        "P newly interrupted by stopped dependency R",
+        [i["entry"] for i in result["newly_interrupted_entries"]] == ["P"],
+        str(result),
+    )
+    reasons = _reason_index(result)
+    check(
+        "P reason follows the chain to the stopped service R",
+        reasons["P"][0]["type"] == "dependency_unavailable"
+        and reasons["P"][0]["dependency"] == "Q",
+        str(reasons),
+    )
+    # Restore G so the following tests start from an all-healthy baseline.
+    st, _ = request("POST", "/reports", {"service": "G", "seq": 3, "status": "recover"})
+    assert st == 200, st
+
+    # --- 6.7 stopping the entry itself -------------------------------------
+    status, result = _sim({"stopped_service": "A", "entries": ["A", "E"]})
+    reasons = _reason_index(result)
+    check("stopping the entry itself -> self_stopped", status == 200, str(result))
+    check(
+        "A reports self_stopped; E fails via dependency A",
+        reasons["A"][0]["type"] == "self_stopped"
+        and reasons["E"][0]["type"] == "dependency_unavailable"
+        and reasons["E"][0]["dependency"] == "A",
+        str(reasons),
+    )
+
+    # --- 6.8 simulation is read-only ---------------------------------------
+    _, alerts_before = request("GET", "/alerts")
+    for _ in range(3):
+        st, _ = _sim({"stopped_service": "D", "entries": ["E"]})
+        assert st == 200
+    _, alerts_after = request("GET", "/alerts")
+    check(
+        "simulation does not modify alert classification or states",
+        alerts_before == alerts_after,
+        "",
+    )
+    _, graph = request("GET", "/graph")
+    check("simulation does not change the graph revision", graph["revision"] == 1, str(graph))
+
+    # --- 6.9 alias route behaves identically -------------------------------
+    status1, r1 = request("POST", "/maintenance/impact",
+                          {"stopped_service": "D", "entries": ["E", "B"]})
+    status2, r2 = _sim({"stopped_service": "D", "entries": ["E", "B"]})
+    check("alias route returns the same result", status1 == status2 == 200 and r1 == r2, str((r1, r2)))
+
+    # --- 6.10 concurrent swaps/reports never produce mixed snapshots -------
+    # Every swapped graph contains S0; use only references that stay valid in
+    # all of them so every simulation must answer 200 against one snapshot.
+    alt_graphs = [
+        {"version": f"swap{i}", "services": [
+            {"name": f"S{j}", "dependencies": [f"S{j-1}"] if j else []}
+            for j in range(i + 2)
+        ]}
+        for i in range(3)
+    ]
+
+    def churn():
+        for g in alt_graphs:
+            request("POST", "/graph", g)
+            for svc in g["services"]:
+                request("POST", "/reports",
+                        {"service": svc["name"], "seq": 1, "status": "recover"})
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        pool.submit(churn)
+        sims = [
+            f.result()
+            for f in [
+                pool.submit(_sim, {
+                    "stopped_service": "S0",
+                    "entries": ["S0"],
+                    "backup_groups": [],
+                })
+                for _ in range(40)
+            ]
+        ]
+    codes = {st for st, _ in sims}
+    check(
+        "concurrent simulations answer 200 or a clean 4xx, never 500/mixed",
+        codes <= {200, 422, 409},
+        str(codes),
+    )
+    ok_bodies = [body for st, body in sims if st == 200]
+    check("at least some simulations completed against a committed snapshot",
+          len(ok_bodies) > 0, str(codes))
+    revisions = {body["graph_revision"] for body in ok_bodies}
+    check("each 200 answer is internally complete and pins one revision",
+          all(
+              isinstance(body["graph_revision"], int)
+              and isinstance(body["already_unavailable_entries"], list)
+              and isinstance(body["newly_interrupted_entries"], list)
+              and body["stopped_service"] == "S0"
+              for body in ok_bodies
+          ),
+          str(revisions))
+
+
 def main() -> int:
     print(f"Self-test against {BASE_URL}\n")
     try:
@@ -467,6 +773,7 @@ def main() -> int:
     test_suppression()
     test_graph_replace_preserves_state()
     test_concurrency()
+    test_downtime_simulation()
 
     print(f"\n{'-' * 60}\nPASS={PASS} FAIL={FAIL}")
     if FAIL:

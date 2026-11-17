@@ -28,3 +28,10 @@ class NoGraph(Exception):
 
     status_code = 409
     code = "no_graph"
+
+
+class SimulationError(Exception):
+    """Downtime simulation request references invalid nodes or backup groups."""
+
+    status_code = 422
+    code = "invalid_simulation"

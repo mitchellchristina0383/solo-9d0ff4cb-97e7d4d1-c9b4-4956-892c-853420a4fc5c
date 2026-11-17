@@ -83,3 +83,75 @@ class ReplaceResponse(BaseModel):
     service_count: int
     edge_count: int
     preserved_state: list[str]
+
+
+# ---------------------------------------------------------------------------
+# Downtime impact simulation
+# ---------------------------------------------------------------------------
+
+
+class BackupGroupIn(BaseModel):
+    service: str = Field(
+        ...,
+        min_length=1,
+        description="The service this backup upstream group is declared for",
+    )
+    members: list[str] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Backup upstream services. Every member must be a DIRECT dependency "
+            "of `service` in the currently committed graph."
+        ),
+    )
+
+
+class DowntimeSimulationPayload(BaseModel):
+    stopped_service: str = Field(
+        ..., min_length=1, description="Service planned to be taken down"
+    )
+    entries: list[str] = Field(
+        ..., min_length=1, description="Key entry services whose availability is checked"
+    )
+    backup_groups: list[BackupGroupIn] = Field(
+        default_factory=list,
+        description="Optional backup upstream groups, declared per service",
+    )
+
+
+class InterruptionReason(BaseModel):
+    type: Literal[
+        "self_stopped",
+        "group_lost_available_member",
+        "dependency_unavailable",
+    ]
+    detail: str = Field(..., description="Human-readable explanation")
+    dependency: Optional[str] = Field(
+        default=None,
+        description="The failing direct dependency (None when the entry itself is stopped)",
+    )
+    group_members: Optional[list[str]] = Field(
+        default=None,
+        description="Members of the backup group that lost every available member",
+    )
+
+
+class EntryInterruption(BaseModel):
+    entry: str
+    reasons: list[InterruptionReason]
+
+
+class DowntimeSimulationResponse(BaseModel):
+    graph_revision: int
+    graph_version: Optional[str]
+    stopped_service: str
+    already_unavailable_entries: list[str] = Field(
+        ..., description="Entries already unavailable BEFORE the planned downtime"
+    )
+    newly_interrupted_entries: list[EntryInterruption] = Field(
+        ...,
+        description="Entries that are available before but unavailable after, with reasons",
+    )
+    after_unavailable_entries: list[str] = Field(
+        ..., description="All unavailable entries AFTER the planned downtime"
+    )

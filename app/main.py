@@ -7,17 +7,20 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .database import close_connection, get_connection, init_db, write_tx
-from .errors import GraphError, NoGraph, ReportConflict, UnknownService
+from .errors import GraphError, NoGraph, ReportConflict, SimulationError, UnknownService
 from .graph_service import classify_alerts, get_graph, replace_graph
 from .report_service import submit_report
 from .schemas import (
     AlertsResponse,
+    DowntimeSimulationPayload,
+    DowntimeSimulationResponse,
     GraphPayload,
     GraphResponse,
     ReplaceResponse,
     ReportPayload,
     ReportResponse,
 )
+from .simulation_service import simulate_downtime
 
 
 @asynccontextmanager
@@ -79,6 +82,14 @@ async def _no_graph(_: Request, exc: NoGraph):
     )
 
 
+@app.exception_handler(SimulationError)
+async def _simulation_error(_: Request, exc: SimulationError):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.code, "detail": str(exc)},
+    )
+
+
 @app.post("/graph", response_model=ReplaceResponse, status_code=200)
 def put_graph(payload: GraphPayload) -> ReplaceResponse:
     """Replace the **whole** dependency graph.
@@ -106,6 +117,38 @@ def post_report(payload: ReportPayload) -> ReportResponse:
 def read_alerts() -> AlertsResponse:
     """Return actionable faults, suppressed faults and their upstream root causes."""
     return AlertsResponse(**classify_alerts())
+
+
+@app.post(
+    "/simulations/downtime",
+    response_model=DowntimeSimulationResponse,
+    status_code=200,
+)
+def post_downtime_simulation(
+    payload: DowntimeSimulationPayload,
+) -> DowntimeSimulationResponse:
+    """Trial-calculate the impact of taking one service down.
+
+    Reads the committed graph and the latest reported states from one
+    consistent snapshot and computes key-entry availability before and after
+    the planned stop.  Backup groups must consist of the target service's
+    direct dependencies; each group is satisfied when at least one member is
+    available.  The simulation is read-only: no alarms or reports change.
+    """
+    return DowntimeSimulationResponse(**simulate_downtime(payload))
+
+
+# Stable alias for clients that prefer the "maintenance" vocabulary.
+@app.post(
+    "/maintenance/impact",
+    response_model=DowntimeSimulationResponse,
+    status_code=200,
+)
+def post_maintenance_impact(
+    payload: DowntimeSimulationPayload,
+) -> DowntimeSimulationResponse:
+    """Alias of ``POST /simulations/downtime``."""
+    return DowntimeSimulationResponse(**simulate_downtime(payload))
 
 
 @app.post("/admin/reset", status_code=200)
